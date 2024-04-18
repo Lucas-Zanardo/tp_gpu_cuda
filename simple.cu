@@ -18,15 +18,16 @@ __global__ void vecMatMultKernel(
         int n
 ) {
     unsigned int i = blockDim.x * blockIdx.x + threadIdx.x;
-    // TODO: accumulate Y[i] in local variable
     if (i < n) {
         int j;
+        REAL_T tmp;
 
         // Split line addition (atomic) -> Occupancy
-        Y[i] = 0;
+        tmp = 0;
         for (j = 0; j < n; j++) {
-            Y[i] += A[i * n + j] * X[j];
+            tmp += A[i * n + j] * X[j];
         }
+        Y[i] = tmp;
     }
 }
 
@@ -128,7 +129,7 @@ int main(int argc, char **argv) {
     {
         n_iterations = 0;
         error = INFINITY;
-        dim3 gridSize(ceil((double) n / 256)); // TODO: voir ceil sur cours calcul matriciel
+        dim3 gridSize(ceil((double) n / 256));
         dim3 blockSize(256);
         printf("GridSize: %d, BlockSize: %d\n", gridSize.x, blockSize.x);
         while (error > ERROR_THRESHOLD) {
