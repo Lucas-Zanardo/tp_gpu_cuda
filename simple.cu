@@ -8,6 +8,10 @@
 #include <math.h>
 #include <sys/time.h>
 
+#ifndef ELEMENTS_PER_BLOCK
+#define ELEMENTS_PER_BLOCK 128
+#endif
+
 #include "CUDA_common.h"
 #include "defs.h"
 
@@ -34,7 +38,8 @@ __global__ void vecMatMultKernel(
 __global__ void normSumKernel(
         REAL_T *Y,
         REAL_T *norm,
-        int n
+        int n,
+        REAL_T *odata
 ) {
     extern __shared__ REAL_T sdata[];
 
@@ -43,8 +48,6 @@ __global__ void normSumKernel(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         sdata[tid] = Y[i];
-    } else {
-        sdata[tid] = 0;
     }
     __syncthreads();
 
@@ -56,7 +59,7 @@ __global__ void normSumKernel(
         __syncthreads();
     }
     // write result for this block to global mem
-    if (tid == 0) atomicAdd(norm, sdata[0]);
+    if (tid == 0) odata[blockIdx.x] = sdata[0];
 }
 
 __global__ void normalizeYKernel(
@@ -66,7 +69,7 @@ __global__ void normalizeYKernel(
 ) {
     unsigned int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i < n) {
-        REAL_T inv_norm = 1.0 / sqrt(*norm); // Avoid back and forth with cpu
+        REAL_T inv_norm = 1.0 / sqrt(*norm);
         Y[i] *= inv_norm;
     }
 }
@@ -124,15 +127,23 @@ int main(int argc, char **argv) {
         X[i] = 1.0 / n;
     }
 
+    // Kernel dimensions
+    dim3 gridSize(ceil((double) n / ELEMENTS_PER_BLOCK));
+    dim3 blockSize(ELEMENTS_PER_BLOCK);
+
     // alloc and transfer data to gpu
     printf("Allocating device memory\n");
     REAL_T *d_A, *d_X, *d_Y;
     REAL_T *d_error, *d_norm;
+    REAL_T *d_norm_tab, *norm_tab;
     cudaMalloc((void **) &d_A, size);
     cudaMalloc((void **) &d_X, sizeof(REAL_T) * n);
     cudaMalloc((void **) &d_Y, sizeof(REAL_T) * n);
     cudaMalloc((void **) &d_error, sizeof(REAL_T));
     cudaMalloc((void **) &d_norm, sizeof(REAL_T));
+
+    norm_tab = (REAL_T *) malloc(sizeof(REAL_T) * gridSize.x);
+    cudaMalloc((void **) &d_norm_tab, sizeof(REAL_T) * gridSize.x);
     printf("Allocated device memory\n");
     // transfer data
     cudaMemcpy(d_A, A, size, cudaMemcpyHostToDevice);
@@ -146,17 +157,20 @@ int main(int argc, char **argv) {
     {
         n_iterations = 0;
         error = INFINITY;
-        dim3 gridSize(ceil((double) n / 256));
-        dim3 blockSize(256);
+
         printf("GridSize: %d, BlockSize: %d\n", gridSize.x, blockSize.x);
         while (error > ERROR_THRESHOLD) {
-            // printf("iteration %4d, current error %g\n", n_iterations, error);
-
             vecMatMultKernel<<<gridSize, blockSize>>>(d_A, d_X, d_Y, n);
 
             // norm
+            normSumKernel<<<gridSize, blockSize, sizeof(REAL_T) * ELEMENTS_PER_BLOCK>>>(d_Y, d_norm, n, d_norm_tab);
+            // Add norm tab on cpu side
+            cudaMemcpy(norm_tab, d_norm_tab, sizeof(REAL_T) * gridSize.x, cudaMemcpyDeviceToHost);
+            norm = 0;
+            for (i = 0; i < gridSize.x; ++i) {
+                norm += norm_tab[i];
+            }
             cudaMemcpy(d_norm, &norm, sizeof(REAL_T), cudaMemcpyHostToDevice);
-            normSumKernel<<<gridSize, blockSize, sizeof(REAL_T) * n>>>(d_Y, d_norm, n);
             normalizeYKernel<<<gridSize, blockSize>>>(d_Y, d_norm, n);
 
             // calculate error
