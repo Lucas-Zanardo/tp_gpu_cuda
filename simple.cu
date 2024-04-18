@@ -36,10 +36,27 @@ __global__ void normSumKernel(
         REAL_T *norm,
         int n
 ) {
-    unsigned int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i < n)
-        atomicAdd(norm, Y[i] * Y[i]);
-    // TODO: Reduction (cf "Réduction en CUDA : Optimizing Parallel Reduction in CUDA” de Mark Harris")
+    extern __shared__ REAL_T sdata[];
+
+    // each thread loads one element from global to shared mem
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        sdata[tid] = Y[i];
+    } else {
+        sdata[tid] = 0;
+    }
+    __syncthreads();
+
+    // do reduction in shared mem
+    for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+        if (tid % (2 * s) == 0) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    // write result for this block to global mem
+    if (tid == 0) atomicAdd(norm, sdata[0]);
 }
 
 __global__ void normalizeYKernel(
@@ -139,7 +156,7 @@ int main(int argc, char **argv) {
 
             // norm
             cudaMemcpy(d_norm, &norm, sizeof(REAL_T), cudaMemcpyHostToDevice);
-            normSumKernel<<<gridSize, blockSize>>>(d_Y, d_norm, n);
+            normSumKernel<<<gridSize, blockSize, sizeof(REAL_T) * n>>>(d_Y, d_norm, n);
             normalizeYKernel<<<gridSize, blockSize>>>(d_Y, d_norm, n);
 
             // calculate error
