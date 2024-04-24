@@ -8,10 +8,13 @@
 #include <math.h>
 #include <sys/time.h>
 
+#define MAX_ITERATIONS 100
+
 #ifndef ELEMENTS_PER_BLOCK
-#define ELEMENTS_PER_BLOCK 128
+#define ELEMENTS_PER_BLOCK 256
 #endif
 
+#include "profile_section.h"
 #include "CUDA_common.h"
 #include "defs.h"
 
@@ -37,7 +40,6 @@ __global__ void vecMatMultKernel(
 
 __global__ void normSumKernel(
         REAL_T *Y,
-        REAL_T *norm,
         int n,
         REAL_T *odata
 ) {
@@ -48,13 +50,16 @@ __global__ void normSumKernel(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         sdata[tid] = Y[i];
+    } else {
+        sdata[i] = 0;
     }
     __syncthreads();
 
     // do reduction in shared mem
     for (unsigned int s = 1; s < blockDim.x; s *= 2) {
-        if (tid % (2 * s) == 0) {
-            sdata[tid] += sdata[tid + s];
+        int index = 2 * s * tid;
+        if (index < blockDim.x) {
+            sdata[index] += sdata[index + s];
         }
         __syncthreads();
     }
@@ -77,15 +82,61 @@ __global__ void normalizeYKernel(
 __global__ void errorKernel(
         REAL_T *Y,
         REAL_T *X,
-        REAL_T *error,
-        int n
+        int n,
+        REAL_T *odata
 ) {
-    unsigned int i = blockDim.x * blockIdx.x + threadIdx.x;
+    extern __shared__ REAL_T sdata[];
+
+    // each thread loads one element from global to shared mem
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        REAL_T delta = X[i] - Y[i];
-        atomicAdd(error, delta * delta);
+        double delta = X[i] - Y[i];
+        sdata[i] = delta * delta;
+    } else {
+        sdata[i] = 0;
     }
+    __syncthreads();
+
+    // do reduction in shared mem
+    for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+        int index = 2 * s * tid;
+        if (index < blockDim.x) {
+            sdata[index] += sdata[index + s];
+        }
+        __syncthreads();
+    }
+    // write result for this block to global mem
+    if (tid == 0) odata[blockIdx.x] = sdata[0];
 }
+
+__global__ void reduce1(
+        REAL_T *indata,
+        REAL_T *odata,
+        int size
+) {
+    extern __shared__ REAL_T sdata[];
+// each thread loads one element from global to shared mem
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size)
+        sdata[i] = indata[i];
+    else
+        sdata[i] = 0;
+    __syncthreads();
+
+    // do reduction in shared mem
+    for (unsigned int s = 1; s < blockDim.x; s *= 2) {
+        int index = 2 * s * tid;
+        if (index < blockDim.x) {
+            sdata[index] += sdata[index + s];
+        }
+        __syncthreads();
+    }
+    // write result for this block to global mem
+    if (tid == 0) odata[blockIdx.x] = sdata[0];
+}
+
 
 
 int main(int argc, char **argv) {
@@ -132,25 +183,26 @@ int main(int argc, char **argv) {
     dim3 blockSize(ELEMENTS_PER_BLOCK);
 
     // alloc and transfer data to gpu
-    printf("Allocating device memory\n");
+    printf("Allocating device memory... ");
     REAL_T *d_A, *d_X, *d_Y;
     REAL_T *d_error, *d_norm;
-    REAL_T *d_norm_tab, *norm_tab;
+    REAL_T *d_input_data, *d_output_data;
     cudaMalloc((void **) &d_A, size);
     cudaMalloc((void **) &d_X, sizeof(REAL_T) * n);
     cudaMalloc((void **) &d_Y, sizeof(REAL_T) * n);
     cudaMalloc((void **) &d_error, sizeof(REAL_T));
     cudaMalloc((void **) &d_norm, sizeof(REAL_T));
 
-    norm_tab = (REAL_T *) malloc(sizeof(REAL_T) * gridSize.x);
-    cudaMalloc((void **) &d_norm_tab, sizeof(REAL_T) * gridSize.x);
-    printf("Allocated device memory\n");
+    cudaMalloc((void **) &d_input_data, sizeof(REAL_T) * gridSize.x);
+    cudaMalloc((void **) &d_output_data, sizeof(REAL_T) * gridSize.x);
+    printf("done\n");
     // transfer data
+    printf("Copying data into device... ");
     cudaMemcpy(d_A, A, size, cudaMemcpyHostToDevice);
     cudaMemcpy(d_X, X, sizeof(REAL_T) * n, cudaMemcpyHostToDevice);
     cudaMemcpy(d_Y, Y, sizeof(REAL_T) * n, cudaMemcpyHostToDevice);
     norm = 0; // reset norm
-    printf("Copied data into device\n");
+    printf("done\n");
 
 
     start_time = my_gettimeofday();
@@ -159,26 +211,62 @@ int main(int argc, char **argv) {
         error = INFINITY;
 
         printf("GridSize: %d, BlockSize: %d\n", gridSize.x, blockSize.x);
-        while (error > ERROR_THRESHOLD) {
-            vecMatMultKernel<<<gridSize, blockSize>>>(d_A, d_X, d_Y, n);
+        while (error > ERROR_THRESHOLD && n_iterations < MAX_ITERATIONS) {
+            printf("Itération %4d -- Error: %g\n", n_iterations, error);
+
+            {
+                profile_cuda_scope("vec mat mult kernel");
+                vecMatMultKernel<<<gridSize, blockSize>>>(d_A, d_X, d_Y, n);
+            }
 
             // norm
-            normSumKernel<<<gridSize, blockSize, sizeof(REAL_T) * ELEMENTS_PER_BLOCK>>>(d_Y, d_norm, n, d_norm_tab);
-            // Add norm tab on cpu side
-            cudaMemcpy(norm_tab, d_norm_tab, sizeof(REAL_T) * gridSize.x, cudaMemcpyDeviceToHost);
-            norm = 0;
-            for (i = 0; i < gridSize.x; ++i) {
-                norm += norm_tab[i];
+            {
+                profile_cuda_scope("norm sum kernel");
+                normSumKernel<<<gridSize, blockSize, sizeof(REAL_T) * blockSize.x>>>(d_Y, n, d_output_data);
+
+                // Reduce
+                int num_input = gridSize.x;
+                int num_output = gridSize.x / blockSize.x;
+                while(num_output > 1) {
+                    printf("Error reduce call\n");
+                    if (num_input % (blockSize.x))
+                        num_output++;
+                    reduce1<<<num_output, blockSize.x, sizeof(REAL_T) * blockSize.x>>>(d_input_data, d_output_data, num_input);
+                    // swap in and out and reduce one more time if needed
+                    num_input = num_output;
+                    if (num_output > 1)
+                        reduce1<<<num_output, blockSize.x>>>(d_output_data, d_input_data, num_input);
+                }
+                // copy calculated norm to cpu
+                cudaMemcpy(&norm, d_output_data, sizeof(REAL_T), cudaMemcpyDeviceToHost);
             }
-            cudaMemcpy(d_norm, &norm, sizeof(REAL_T), cudaMemcpyHostToDevice);
-            normalizeYKernel<<<gridSize, blockSize>>>(d_Y, d_norm, n);
+
+            {
+                profile_cuda_scope("normalize y");
+                normalizeYKernel<<<gridSize, blockSize>>>(d_Y, &d_output_data[0], n);
+            }
 
             // calculate error
-            error = 0;
-            cudaMemcpy(d_error, &error, sizeof(REAL_T), cudaMemcpyHostToDevice);
-            errorKernel<<<gridSize, blockSize>>>(d_Y, d_X, d_error, n);
-            cudaMemcpy(&error, d_error, sizeof(REAL_T), cudaMemcpyDeviceToHost);
-            error = sqrt(error);
+            {
+                profile_cuda_scope("error kernel");
+                errorKernel<<<gridSize, blockSize, sizeof(REAL_T) * blockSize.x>>>(d_Y, d_X, n, d_output_data);
+
+                // Reduce
+                int num_input = gridSize.x;
+                int num_output = gridSize.x / blockSize.x;
+                while(num_output > 1) {
+                    printf("Error reduce call\n");
+                    if (num_input % (blockSize.x))
+                        num_output++;
+                    reduce1<<<num_output, blockSize.x, sizeof(REAL_T) * blockSize.x>>>(d_input_data, d_output_data, num_input);
+                    // swap in and out and reduce one more time if needed
+                    num_input = num_output;
+                    if (num_output > 1)
+                        reduce1<<<num_output, blockSize.x>>>(d_output_data, d_input_data, num_input);
+                }
+                cudaMemcpy(&error, d_output_data, sizeof(REAL_T), cudaMemcpyDeviceToHost);
+                error = sqrt(error);
+            }
 
             // swap device pointers
             REAL_T *d_tmp = d_X;
@@ -188,7 +276,7 @@ int main(int argc, char **argv) {
             n_iterations++;
         }
         // get back eigen vector and norm
-        cudaMemcpy(&norm, d_norm, sizeof(REAL_T), cudaMemcpyDeviceToHost);
+        // cudaMemcpy(&norm, d_output_data, sizeof(REAL_T), cudaMemcpyDeviceToHost);
         norm = sqrt(norm);
         cudaMemcpy(X, d_X, sizeof(REAL_T) * n, cudaMemcpyDeviceToHost);
     }
@@ -216,4 +304,6 @@ int main(int argc, char **argv) {
     cudaFree(d_X);
     free(Y);
     cudaFree(d_Y);
+    cudaFree(d_input_data);
+    cudaFree(d_output_data);
 }

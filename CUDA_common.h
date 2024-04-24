@@ -1,3 +1,6 @@
+#ifdef CUDA_COMMON_H
+#define CUDA_COMMON_H
+
 #include <cuda.h>
 #include <stdio.h>
 
@@ -13,7 +16,7 @@
     sync_error = cudaGetLastError();					\
     if(sync_error != cudaSuccess) {					\
       fprintf(stderr, "[CUDA SYNC ERROR at %s:%d -> %s]\n",		\
-	      __FILE__ , __LINE__, cudaGetErrorString(sync_error));	\
+        __FILE__ , __LINE__, cudaGetErrorString(sync_error));	\
       exit(EXIT_FAILURE);						\
     }									\
   }
@@ -25,7 +28,7 @@
     cudaError_t error = cuda_call;				\
     if(error != cudaSuccess){					\
       fprintf(stderr, "[CUDA ERROR at %s:%d -> %s]\n",		\
-	      __FILE__ , __LINE__, cudaGetErrorString(error));	\
+        __FILE__ , __LINE__, cudaGetErrorString(error));	\
       exit(EXIT_FAILURE);					\
     }								\
     CUDA_SYNC_ERROR();						\
@@ -42,3 +45,4 @@ static int iDivUp(int a, int b){
   return ((a % b != 0) ? (a / b + 1) : (a / b));
 }
 
+#endif // CUDA_COMMON_H
