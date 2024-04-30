@@ -17,6 +17,8 @@
 #include "CUDA_common.h"
 #include "defs.h"
 
+#include "cublas_v2.h"
+
 __global__ void vecMatMultKernel(
         REAL_T *A,
         REAL_T *X,
@@ -131,6 +133,9 @@ int main(int argc, char **argv) {
     int n_iterations;
     FILE *output;
 
+    cublasStatus_t stat;
+    cublasHandle_t handle;
+
     if (argc < 2) {
         printf("USAGE: %s [n]\n", argv[0]);
         exit(1);
@@ -161,6 +166,13 @@ int main(int argc, char **argv) {
         X[i] = 1.0 / n;
     }
 
+    stat = cublasCreate(&handle);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf ("CUBLAS initialization failed\n");
+        return EXIT_FAILURE;
+    }
+
+
     // Kernel dimensions
     dim3 gridSize(ceil((double) n / ELEMENTS_PER_BLOCK));
     dim3 blockSize(ELEMENTS_PER_BLOCK);
@@ -168,7 +180,7 @@ int main(int argc, char **argv) {
     // alloc and transfer data to gpu
     printf("Allocating device memory... ");
     REAL_T *d_A, *d_X, *d_Y;
-    REAL_T *d_error, *d_norm;
+    REAL_T *d_error, *d_norm, *d_one;
     REAL_T *d_einput_data, *d_eoutput_data;
     REAL_T *d_ninput_data, *d_noutput_data;
     cudaMalloc((void **) &d_A, size);
@@ -176,6 +188,7 @@ int main(int argc, char **argv) {
     cudaMalloc((void **) &d_Y, sizeof(REAL_T) * n);
     cudaMalloc((void **) &d_error, sizeof(REAL_T));
     cudaMalloc((void **) &d_norm, sizeof(REAL_T));
+    cudaMalloc((void **) &d_one, sizeof(REAL_T));
 
     cudaMalloc((void **) &d_einput_data, sizeof(REAL_T) * n);
     cudaMalloc((void **) &d_ninput_data, sizeof(REAL_T) * n);
@@ -184,13 +197,14 @@ int main(int argc, char **argv) {
     printf("done\n");
     // transfer data
     printf("Copying data into device... ");
-    cudaMemcpy(d_A, A, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X, X, sizeof(REAL_T) * n, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_Y, Y, sizeof(REAL_T) * n, cudaMemcpyHostToDevice);
+    cublasSetMatrix(n, n, sizeof(*A), A, n, d_A, n);
+    cublasSetVector(n, sizeof(*X), X, 1, d_X, 1);
+    cublasSetVector(n, sizeof(*Y), Y, 1, d_Y, 1);
+    float one = 1.f;
+    cudaMemcpy(d_one, &one, sizeof(REAL_T), cudaMemcpyHostToDevice);
     norm = 0; // reset norm
+    // cublas
     printf("done\n");
-
-    cudaDeviceSynchronize();
 
     start_time = my_gettimeofday();
     {
@@ -203,28 +217,31 @@ int main(int argc, char **argv) {
 
             {
                 profile_cuda_scope("vec mat mult kernel");
-                vecMatMultKernel<<<gridSize, blockSize>>>(d_A, d_X, d_Y, n);
+                cublasSgemv(handle, CUBLAS_OP_N, n, n, &one, d_A, n, d_X, 1, &one, d_Y, 1);
+                // vecMatMultKernel<<<gridSize, blockSize>>>(d_A, d_X, d_Y, n);
             }
 
             // norm
             {
                 profile_cuda_scope("norm sum kernel");
                 // square and output in d_output_data (could be its own kernel with reduction)
-                normSumKernel<<<gridSize, blockSize>>>(d_Y, n, d_ninput_data);
-                reduceArray(d_ninput_data, d_noutput_data, n);
+                // normSumKernel<<<gridSize, blockSize>>>(d_Y, n, d_ninput_data);
+                cublasSnrm2(handle, n, d_Y, 1, d_norm);
+                // reduceArray(d_ninput_data, d_noutput_data, n);
             }
 
             {
                 profile_cuda_scope("normalize y");
-                normalizeYKernel<<<gridSize, blockSize>>>(d_Y, &d_noutput_data[0], n);
+                normalizeYKernel<<<gridSize, blockSize>>>(d_Y, d_norm, n);
             }
 
             // calculate error
             {
                 profile_cuda_scope("error kernel");
                 errorKernel<<<gridSize, blockSize>>>(d_Y, d_X, n, d_einput_data);
-                reduceArray(d_einput_data, d_eoutput_data, n);
-                cudaMemcpy(&error, d_eoutput_data, sizeof(REAL_T), cudaMemcpyDeviceToHost);
+                cublasSasum(handle, n, d_einput_data, 1, error);
+                // reduceArray(d_einput_data, d_eoutput_data, n);
+                // cudaMemcpy(&error, d_eoutput_data, sizeof(REAL_T), cudaMemcpyDeviceToHost);
                 error = sqrt(error);
             }
 
@@ -262,6 +279,8 @@ int main(int argc, char **argv) {
     }
     fclose(output);
 
+    // free all
+    cublasDestroy(handle);
     free(A);
     cudaFree(d_A);
     free(X);
@@ -272,4 +291,7 @@ int main(int argc, char **argv) {
     cudaFree(d_eoutput_data);
     cudaFree(d_noutput_data);
     cudaFree(d_noutput_data);
+    cudaFree(d_one);
+    cudaFree(d_norm);
+    cudaFree(d_error);
 }
