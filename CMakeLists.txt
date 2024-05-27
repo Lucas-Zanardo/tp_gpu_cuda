@@ -19,8 +19,8 @@ if (MATH_LIBRARY)
     target_link_libraries(sequential PUBLIC ${MATH_LIBRARY})
 endif ()
 
-target_compile_options(checker PRIVATE -O3 -march=native -mtune=native)
-target_compile_options(sequential PRIVATE -O3 -march=native -mtune=native)
+target_compile_options(checker PRIVATE "-O3 -march=native -mtune=native")
+target_compile_options(sequential PRIVATE "-O3 -march=native -mtune=native")
 
 # CUDA
 if ($ENV{CLION_IDE})

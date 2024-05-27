@@ -9,7 +9,7 @@
 #include <sys/time.h>
 
 #ifndef ELEMENTS_PER_BLOCK
-#define ELEMENTS_PER_BLOCK 256
+#define ELEMENTS_PER_BLOCK 128
 #endif
 
 // #define PROFILING
@@ -59,10 +59,11 @@ __global__ void normalizeYKernel(
 ) {
     unsigned int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i < n) {
-        REAL_T inv_norm = 1.0 / sqrt(*norm);
+        REAL_T inv_norm = 1.0 / *norm;
         Y[i] *= inv_norm;
     }
 }
+
 
 __global__ void errorKernel(
         REAL_T *Y,
@@ -197,9 +198,13 @@ int main(int argc, char **argv) {
     printf("done\n");
     // transfer data
     printf("Copying data into device... ");
-    cublasSetMatrix(n, n, sizeof(*A), A, n, d_A, n);
+    /*cublasSetMatrix(n, n, sizeof(*A), A, n, d_A, n);
     cublasSetVector(n, sizeof(*X), X, 1, d_X, 1);
-    cublasSetVector(n, sizeof(*Y), Y, 1, d_Y, 1);
+    cublasSetVector(n, sizeof(*Y), Y, 1, d_Y, 1);*/
+    cudaMemcpy(d_A, A, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_X, X, sizeof(REAL_T) * n, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_Y, Y, sizeof(REAL_T) * n, cudaMemcpyHostToDevice);
+    norm = 0; // reset norm
     float one = 1.f;
     cudaMemcpy(d_one, &one, sizeof(REAL_T), cudaMemcpyHostToDevice);
     norm = 0; // reset norm
@@ -225,8 +230,9 @@ int main(int argc, char **argv) {
             {
                 profile_cuda_scope("norm sum kernel");
                 // square and output in d_output_data (could be its own kernel with reduction)
-                // normSumKernel<<<gridSize, blockSize>>>(d_Y, n, d_ninput_data);
+                cublasSetPointerMode(handle,CUBLAS_POINTER_MODE_DEVICE);
                 cublasSnrm2(handle, n, d_Y, 1, d_norm);
+                // normSumKernel<<<gridSize, blockSize>>>(d_Y, n, d_ninput_data);
                 // reduceArray(d_ninput_data, d_noutput_data, n);
             }
 
@@ -239,9 +245,10 @@ int main(int argc, char **argv) {
             {
                 profile_cuda_scope("error kernel");
                 errorKernel<<<gridSize, blockSize>>>(d_Y, d_X, n, d_einput_data);
-                cublasSasum(handle, n, d_einput_data, 1, error);
+                cublasSetPointerMode(handle,CUBLAS_POINTER_MODE_HOST);
+                cublasSasum(handle, n, d_einput_data, 1, &error);
                 // reduceArray(d_einput_data, d_eoutput_data, n);
-                // cudaMemcpy(&error, d_eoutput_data, sizeof(REAL_T), cudaMemcpyDeviceToHost);
+                // cudaMemcpy(&error, d_error, sizeof(REAL_T), cudaMemcpyDeviceToHost);
                 error = sqrt(error);
             }
 
@@ -257,7 +264,7 @@ int main(int argc, char **argv) {
             }
         }
         // get back eigen vector and norm
-        cudaMemcpy(&norm, d_noutput_data, sizeof(REAL_T), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&norm, d_norm, sizeof(REAL_T), cudaMemcpyDeviceToHost);
         norm = sqrt(norm);
         cudaMemcpy(X, d_X, sizeof(REAL_T) * n, cudaMemcpyDeviceToHost);
     }
